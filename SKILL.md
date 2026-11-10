@@ -121,7 +121,7 @@ WaitForEvent (timeoutMs: 120000)  — keep watching
 
 ---
 
-## Rule 4: All 84 Tools Reference
+## Rule 4: All 80 Tools Reference
 
 Every tool response includes a `[state]` line showing current debugger status and any `[event:*]` lines with queued events. You always know where you are.
 
@@ -133,13 +133,13 @@ Every tool response includes a `[state]` line showing current debugger status an
 | `AttachProcess` | `pid` | Attach to a running process by PID |
 | `run` | `timeoutMs?` (default 300000) | Resume execution (F9). Blocks until target pauses or timeout |
 | `PauseDebug` | — | Pause the target (F12) |
-| `WaitForPause` | `timeout?` (ms, default 10000) | Block until target pauses (breakpoint/exception) |
+| `WaitForPause` | `timeoutMs?` (ms, default 30000) | Block until target pauses (breakpoint/exception) |
 | `StopDebug` | — | Terminate debug session |
 | `RestartDebug` | — | Restart debug session |
 | `ExecuteDebuggerCommand` | `command` | Run any x64dbg command string. Blocks if target becomes RUNNING |
 | `EvalExpression` | `expression` | Evaluate expression (address, register, symbol, arithmetic) |
 | `Echo` | `message` | Echo input back (connectivity test) |
-| `ListCommandsByCategory` | `category?` | List available MCP tools |
+| `ListCommandsByCategory` | — (a non-empty `category` is refused) | List every MCP tool; there is no category filter |
 | `SearchForStrings` | `searchText` | Search process memory for text |
 | `GetEventLog` | `count?` (default 20) | Last N debugger events |
 | `ClearEventLog` | — | Clear the event log |
@@ -177,7 +177,7 @@ Every tool response includes a `[state]` line showing current debugger status an
 ### Disassembly & Code (requires PAUSED)
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `Disassemble` | `address?`, `count?` (default 16) | Disassemble N instructions |
+| `Disassemble` | `address?`, `count?` (default 10, clamped to [1, 100]) | Disassemble N instructions |
 | `DisassembleFunction` | `address?` | Disassemble entire function (needs analysis first) |
 | `GetCurrentAddress` | — | Current EIP/RIP with label and comment |
 | `GetFunctions` | `module?` | List analyzed functions with addresses |

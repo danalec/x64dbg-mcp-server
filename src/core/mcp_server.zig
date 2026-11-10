@@ -29,7 +29,13 @@ extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn WaitForSingleObject(hHandle: ?*anyopaque, dwMilliseconds: u32) callconv(.winapi) u32;
 
 var server_handle: HANDLE = null;
-pub var server_running: bool = false;
+/// Written on start/stop, read by the accept loop and the callbacks: a plain
+/// bool here is a data race, so it is atomic.
+pub var server_running = std.atomic.Value(bool).init(false);
+
+/// The pending-event ring and the SSE table are written by the callbacks and read
+/// by the HTTP threads; every accessor below takes this lock.
+var state_lock = std.Thread.Mutex{};
 var listen_sock: SOCKET = INVALID_SOCKET;
 
 pub var server_port: u16 = 9094;
@@ -90,10 +96,14 @@ var pending_head: usize = 0;
 var pending_count: usize = 0;
 
 pub fn pendingHasEvents() bool {
+    state_lock.lock();
+    defer state_lock.unlock();
     return pending_count > 0;
 }
 
 pub fn pendingDrainToBuffer(out: []u8) usize {
+    state_lock.lock();
+    defer state_lock.unlock();
     var pos: usize = 0;
     while (pending_count > 0) {
         const slot = pending_head;
@@ -113,6 +123,8 @@ pub fn pendingDrainToBuffer(out: []u8) usize {
 }
 
 fn pendingPush(msg: []const u8) void {
+    state_lock.lock();
+    defer state_lock.unlock();
     const slot = (pending_head + pending_count) % MAX_PENDING_EVENTS;
     const copy_len = @min(msg.len, MAX_EVENT_LEN);
     @memcpy(pending_events[slot][0..copy_len], msg[0..copy_len]);
@@ -125,6 +137,8 @@ fn pendingPush(msg: []const u8) void {
 }
 
 fn pendingDrain(w: *JsonWriter) void {
+    state_lock.lock();
+    defer state_lock.unlock();
     while (pending_count > 0) {
         const slot = pending_head;
         const event_text = pending_events[slot][0..pending_event_lens[slot]];
@@ -147,6 +161,8 @@ var sse_session_lens: [MAX_SSE_CLIENTS]usize = .{0} ** MAX_SSE_CLIENTS;
 var sse_next_id: u32 = 1;
 
 fn sseAddClient(sock: SOCKET) ?usize {
+    state_lock.lock();
+    defer state_lock.unlock();
     for (0..MAX_SSE_CLIENTS) |i| {
         if (sse_clients[i] == INVALID_SOCKET) {
             sse_clients[i] = sock;
@@ -161,6 +177,8 @@ fn sseAddClient(sock: SOCKET) ?usize {
 }
 
 fn sseRemoveClient(idx: usize) void {
+    state_lock.lock();
+    defer state_lock.unlock();
     if (idx < MAX_SSE_CLIENTS) {
         sse_clients[idx] = INVALID_SOCKET;
         sse_session_lens[idx] = 0;
@@ -168,6 +186,8 @@ fn sseRemoveClient(idx: usize) void {
 }
 
 fn sseFindBySessionId(session_id: []const u8) ?usize {
+    state_lock.lock();
+    defer state_lock.unlock();
     for (0..MAX_SSE_CLIENTS) |i| {
         if (sse_clients[i] != INVALID_SOCKET and sse_session_lens[i] > 0) {
             if (std.mem.eql(u8, sse_session_ids[i][0..sse_session_lens[i]], session_id)) {
@@ -187,7 +207,7 @@ fn sseSendEvent(sock: SOCKET, event: []const u8, data: []const u8) void {
 }
 
 pub fn notifyEvent(level: []const u8, msg: []const u8) void {
-    if (!server_running) return;
+    if (!server_running.load(.acquire)) return;
 
     // Queue for HTTP clients — plain text with level prefix
     var pend_buf: [MAX_EVENT_LEN]u8 = undefined;
@@ -200,9 +220,15 @@ pub fn notifyEvent(level: []const u8, msg: []const u8) void {
         "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{\"level\":\"{s}\",\"data\":\"{s}\"}}}}",
         .{ level, msg },
     ) catch return;
-    for (0..MAX_SSE_CLIENTS) |i| {
-        if (sse_clients[i] != INVALID_SOCKET) {
-            sseSendEvent(sse_clients[i], "message", json);
+    // Copy the sockets under the lock and send outside it: a send can block, and
+    // the debug callbacks must not wait behind a slow HTTP client.
+    var sockets: [MAX_SSE_CLIENTS]SOCKET = .{INVALID_SOCKET} ** MAX_SSE_CLIENTS;
+    state_lock.lock();
+    for (0..MAX_SSE_CLIENTS) |i| sockets[i] = sse_clients[i];
+    state_lock.unlock();
+    for (sockets) |sock| {
+        if (sock != INVALID_SOCKET) {
+            sseSendEvent(sock, "message", json);
         }
     }
 }
@@ -256,16 +282,16 @@ fn fmtPort(val: u16, buf: []u8) usize {
 }
 
 pub fn start() void {
-    if (server_running) {
+    if (server_running.load(.acquire)) {
         bridge.logPuts("[x64dbg-MCP Server] Server already running.\x00");
         return;
     }
 
-    server_running = true;
+    server_running.store(true, .release);
 
     server_handle = CreateThread(null, 0, serverThreadProc, null, 0, null);
     if (server_handle == null) {
-        server_running = false;
+        server_running.store(false, .release);
         bridge.logPuts("[x64dbg-MCP Server] Failed to create server thread.\x00");
         return;
     }
@@ -289,8 +315,8 @@ pub fn start() void {
 }
 
 pub fn stop() void {
-    if (!server_running) return;
-    server_running = false;
+    if (!server_running.load(.acquire)) return;
+    server_running.store(false, .release);
 
     // Close all SSE client sockets to unblock their keepalive loops
     for (&sse_clients) |*slot| {
@@ -343,14 +369,14 @@ fn clientThreadProc(param: ?*anyopaque) callconv(.winapi) u32 {
 fn serverLoop() void {
     var wsa_data: ws2.WSADATA = undefined;
     if (ws2.WSAStartup(0x0202, &wsa_data) != 0) {
-        server_running = false;
+        server_running.store(false, .release);
         bridge.logPuts("[x64dbg-MCP Server] WSAStartup failed.\x00");
         return;
     }
 
     const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.STREAM, 0);
     if (sock == INVALID_SOCKET) {
-        server_running = false;
+        server_running.store(false, .release);
         bridge.logPuts("[x64dbg-MCP Server] socket() failed.\x00");
         _ = ws2.WSACleanup();
         return;
@@ -372,23 +398,23 @@ fn serverLoop() void {
     };
 
     if (ws2.bind(sock, @ptrCast(&addr), @sizeOf(ws2.sockaddr.in)) != 0) {
-        server_running = false;
+        server_running.store(false, .release);
         bridge.logPuts("[x64dbg-MCP Server] bind() failed.\x00");
         return;
     }
 
     if (ws2.listen(sock, 10) != 0) {
-        server_running = false;
+        server_running.store(false, .release);
         bridge.logPuts("[x64dbg-MCP Server] listen() failed.\x00");
         return;
     }
 
     logListening();
 
-    while (server_running) {
+    while (server_running.load(.acquire)) {
         const client = ws2.accept(sock, null, null);
         if (client == INVALID_SOCKET) {
-            if (!server_running) break;
+            if (!server_running.load(.acquire)) break;
             continue;
         }
 
@@ -444,12 +470,8 @@ fn handleClient(sock: SOCKET) void {
     const request = recv_result.buf[0..recv_result.len];
     const method_line = getFirstLine(request);
 
-    if (std.mem.startsWith(u8, method_line, "OPTIONS ")) {
-        wsSend(sock, "HTTP/1.1 204 No Content\r\n" ++ CORS_HEADERS ++ "\r\n");
-        _ = ws2.closesocket(sock);
-        return;
-    }
-
+    // The preflight is answered *after* the token check, like every other request:
+    // answering it first let an unauthenticated page probe the server.
     {
         const headers_slice = if (findHeaderEnd(request)) |he| request[0..he] else request;
         const tok = parseHeaderValue(headers_slice, "Authorization");
@@ -467,6 +489,12 @@ fn handleClient(sock: SOCKET) void {
             _ = ws2.closesocket(sock);
             return;
         }
+    }
+
+    if (std.mem.startsWith(u8, method_line, "OPTIONS ")) {
+        wsSend(sock, "HTTP/1.1 204 No Content\r\n" ++ CORS_HEADERS ++ "\r\n");
+        _ = ws2.closesocket(sock);
+        return;
     }
 
     if (std.mem.startsWith(u8, method_line, "GET ")) {
@@ -551,6 +579,10 @@ fn handleInitialize(sock: SOCKET, id: ?std.json.Value) void {
     var buf: [4096]u8 = undefined;
     var w = JsonWriter.init(&buf);
     buildInitializeResult(&w);
+    if (!w.ok()) {
+        sendJsonRpcError(sock, id, -32603, "initialize result exceeds the buffer");
+        return;
+    }
     sendJsonRpcResult(sock, id, w.slice());
 }
 
@@ -558,6 +590,12 @@ fn handleToolsList(sock: SOCKET, id: ?std.json.Value) void {
     var buf: [65536]u8 = undefined;
     var w = JsonWriter.init(&buf);
     buildToolsListResult(&w);
+    if (!w.ok()) {
+        // 80 tools are ~32 KB today; one doubling would reach the ceiling. A
+        // truncated list is not a list, so the caller gets an error it can report.
+        sendJsonRpcError(sock, id, -32603, "the tool list exceeds the server buffer");
+        return;
+    }
     sendJsonRpcResult(sock, id, w.slice());
 }
 
@@ -565,6 +603,10 @@ fn handleToolsCall(sock: SOCKET, id: ?std.json.Value, root: std.json.Value) void
     var buf: [131072]u8 = undefined;
     var w = JsonWriter.init(&buf);
     buildToolsCallResult(&w, root);
+    if (!w.ok()) {
+        sendJsonRpcError(sock, id, -32603, "the tool result exceeds the server buffer");
+        return;
+    }
     const result_str = w.slice();
     if (std.mem.startsWith(u8, result_str, "{\"error\":")) {
         sendJsonRpcError(sock, id, -32602, result_str);
@@ -594,7 +636,7 @@ fn handleSseConnect(sock: SOCKET) void {
     bridge.logPuts("[x64dbg-MCP Server] SSE client connected.\x00");
 
     // Keep connection alive until client disconnects or server stops
-    while (server_running) {
+    while (server_running.load(.acquire)) {
         Sleep(5000);
         // Send keep-alive comment
         const n = ws2.send(sock, ": keepalive\n\n", 13, 0);
@@ -842,7 +884,11 @@ fn parseHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
 
 // ── HTTP helpers ────────────────────────────────────────────────────
 
-const CORS_HEADERS = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, Mcp-Session-Id, Accept\r\nAccess-Control-Expose-Headers: Mcp-Session-Id\r\n";
+// No `Access-Control-Allow-Origin: *`: a server with debugger control and memory
+// write access must not let any page read its answers. A browser client would need
+// an explicit allowlist, and there is none because there is no browser client — the
+// agents speak stdio to the bridge, or HTTP from a process that sends the token.
+const CORS_HEADERS = "Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, Mcp-Session-Id, Accept\r\nAccess-Control-Expose-Headers: Mcp-Session-Id\r\n";
 
 fn sendServerInfo(sock: SOCKET) void {
     var body_buf: [256]u8 = undefined;
@@ -850,6 +896,21 @@ fn sendServerInfo(sock: SOCKET) void {
     var buf: [512]u8 = undefined;
     const resp = std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch return;
     wsSend(sock, resp);
+}
+
+/// The last resort: a frame small enough that it always fits (an id and a fixed
+/// message). Used when the error message itself overflowed the buffer.
+fn sendMinimalError(sock: SOCKET, id: ?std.json.Value) void {
+    var buf: [512]u8 = undefined;
+    var w = JsonWriter.init(&buf);
+    w.raw("{\"jsonrpc\":\"2.0\",\"id\":");
+    writeJsonValue(&w, id);
+    w.raw(",\"error\":{\"code\":-32603,\"message\":\"response too large\"}}");
+    if (!w.ok()) return;
+    var header_buf: [256]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{w.pos}) catch return;
+    wsSend(sock, header);
+    wsSend(sock, w.slice());
 }
 
 fn sendJsonRpcResult(sock: SOCKET, id: ?std.json.Value, result_json: []const u8) void {
@@ -861,6 +922,10 @@ fn sendJsonRpcResult(sock: SOCKET, id: ?std.json.Value, result_json: []const u8)
     w.raw(result_json);
     w.raw("}");
 
+    if (!w.ok()) {
+        sendJsonRpcError(sock, id, -32603, "response exceeds the server buffer");
+        return;
+    }
     const body_slice = w.slice();
     var header_buf: [512]u8 = undefined;
     const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body_slice.len}) catch return;
@@ -880,6 +945,12 @@ fn sendJsonRpcError(sock: SOCKET, id: ?std.json.Value, code: i32, message: []con
     w.writeString(message);
     w.raw("}}");
 
+    if (!w.ok()) {
+        // The message itself is too large (a tool result is passed as one). A
+        // frame that does not fit must not be sent at all.
+        sendMinimalError(sock, id);
+        return;
+    }
     const body_slice = w.slice();
     var header_buf: [512]u8 = undefined;
     const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body_slice.len}) catch return;

@@ -18,6 +18,12 @@ const MENU_TOGGLE: c_int = 1;
 const MENU_CONFIG: c_int = 2;
 const MENU_ABOUT: c_int = 3;
 
+// ── Concurrency ────────────────────────────────────────────────────
+// The debug callbacks run on x64dbg's threads; the HTTP server answers on a thread
+// per connection. The event ring and the debuggee path are touched from both, so
+// their accessors take this lock. Nothing holds it across I/O.
+var state_lock = std.Thread.Mutex{};
+
 // ── Event log ring buffer ──────────────────────────────────────────
 const EVENT_LOG_SIZE = 64;
 const EVENT_MSG_SIZE = 192;
@@ -28,6 +34,8 @@ var event_log_head: usize = 0;
 var event_log_count: usize = 0;
 
 pub fn pushEvent(msg: []const u8) void {
+    state_lock.lock();
+    defer state_lock.unlock();
     const len = @min(msg.len, EVENT_MSG_SIZE);
     @memcpy(event_log[event_log_head][0..len], msg[0..len]);
     event_log_lens[event_log_head] = len;
@@ -36,17 +44,33 @@ pub fn pushEvent(msg: []const u8) void {
 }
 
 pub fn getEventCount() usize {
+    state_lock.lock();
+    defer state_lock.unlock();
     return event_log_count;
 }
 
-pub fn getEvent(index: usize) []const u8 {
-    if (index >= event_log_count) return "";
+/// Copy event `index` into `out` and return the copied slice.
+///
+/// A slice into the ring must not escape the lock: between the unlock and the
+/// caller's read, a callback can wrap the buffer and overwrite it. Copying under
+/// the lock is the only shape that is safe for a reader on another thread.
+pub fn copyEvent(index: usize, out: []u8) []const u8 {
+    state_lock.lock();
+    defer state_lock.unlock();
+    if (index >= event_log_count) return out[0..0];
     const start = if (event_log_count < EVENT_LOG_SIZE) 0 else event_log_head;
     const i = (start + index) % EVENT_LOG_SIZE;
-    return event_log[i][0..event_log_lens[i]];
+    const len = @min(event_log_lens[i], out.len);
+    @memcpy(out[0..len], event_log[i][0..len]);
+    return out[0..len];
 }
 
+/// The longest message the ring holds, for the caller's buffer.
+pub const MAX_EVENT = EVENT_MSG_SIZE;
+
 pub fn clearEvents() void {
+    state_lock.lock();
+    defer state_lock.unlock();
     event_log_count = 0;
     event_log_head = 0;
 }
@@ -56,19 +80,26 @@ pub fn clearEvents() void {
 // x64dbg supplies the full executable path in CB_INITDEBUG.  Keep a
 // private copy so RestartDebug can issue the same "init <path>"
 // operation as x64dbg's normal restart behaviour.
-const DEBUGGEE_PATH_SIZE = 1024;
+pub const DEBUGGEE_PATH_SIZE = 1024;
 var current_debuggee_path: [DEBUGGEE_PATH_SIZE]u8 = undefined;
 var current_debuggee_path_len: usize = 0;
 
 pub fn setCurrentDebuggeePath(path: []const u8) void {
+    state_lock.lock();
+    defer state_lock.unlock();
     const len = @min(path.len, DEBUGGEE_PATH_SIZE - 1);
     @memcpy(current_debuggee_path[0..len], path[0..len]);
     current_debuggee_path[len] = 0;
     current_debuggee_path_len = len;
 }
 
-pub fn getCurrentDebuggeePath() []const u8 {
-    return current_debuggee_path[0..current_debuggee_path_len];
+/// Copy the debuggee path into `out` and return the copied slice (see copyEvent).
+pub fn copyCurrentDebuggeePath(out: []u8) []const u8 {
+    state_lock.lock();
+    defer state_lock.unlock();
+    const len = @min(current_debuggee_path_len, out.len);
+    @memcpy(out[0..len], current_debuggee_path[0..len]);
+    return out[0..len];
 }
 
 const HWND = ?*anyopaque;
@@ -184,7 +215,7 @@ export fn CBMENUENTRY(_: bridge.CBTYPE, info: *bridge.PLUG_CB_MENUENTRY) callcon
 }
 
 fn toggleServer() void {
-    if (mcp.server_running) {
+    if (mcp.server_running.load(.acquire)) {
         mcp.stop();
     } else {
         mcp.start();
@@ -195,7 +226,7 @@ fn toggleServer() void {
 fn rebuildMenu() void {
     _ = bridge._plugin_menuclear(main_menu);
 
-    if (mcp.server_running) {
+    if (mcp.server_running.load(.acquire)) {
         _ = bridge._plugin_menuaddentry(main_menu, MENU_TOGGLE, "&Stop MCP Server\x00");
         setEntryIcon(MENU_TOGGLE, icons.stop_icon);
     } else {

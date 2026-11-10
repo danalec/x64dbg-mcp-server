@@ -56,7 +56,7 @@ pub const tools = [_]ToolDef{
     },
     .{
         .name = "ListCommandsByCategory",
-        .description = "Lists the available MCP tools, optionally filtered to a single category.",
+        .description = "Lists every MCP tool with its description. There is no category filter: the tools are a flat list, and the debugger's own commands are a separate namespace. A non-empty category is refused.",
         .debug_only = false,
         .read_only = true,
         .handler = listCommandsByCategory,
@@ -979,8 +979,9 @@ fn getEventLog(params: ?std.json.Value, out: []u8) ToolResult {
     pos += header.len;
 
     var i: usize = start_idx;
+    var evt_buf: [main.MAX_EVENT]u8 = undefined;
     while (i < total) : (i += 1) {
-        const evt = main.getEvent(i);
+        const evt = main.copyEvent(i, &evt_buf);
         if (pos + evt.len + 2 > out.len) break;
         @memcpy(out[pos .. pos + evt.len], evt);
         pos += evt.len;
@@ -1167,9 +1168,18 @@ fn waitForEvent(params: ?std.json.Value, out: []u8) ToolResult {
 
 // ── ListCommandsByCategory ──────────────────────────────────────────
 fn listCommandsByCategory(params: ?std.json.Value, out: []u8) ToolResult {
-    _ = params;
+    // There is no category concept in this plugin: the tools are a flat list and the
+    // debugger's own commands are a different namespace. A category used to be
+    // accepted and ignored, which made the tool lie about filtering — so it is
+    // refused, and the answer says what is actually listed.
+    if (getParamStr(params, "category")) |category| {
+        if (category.len > 0) {
+            return errResult(out, "Error: categories are not supported. This tool lists "
+                ++ "every MCP tool; the debugger's commands are a separate namespace.");
+        }
+    }
     var w = JsonWriter.init(out);
-    w.raw("Available tools:\n");
+    w.raw("Available MCP tools (not x64dbg commands):\n");
     for (&tools) |*t| {
         w.raw("- ");
         w.raw(t.name);
@@ -1444,7 +1454,8 @@ fn restartDebug(_: ?std.json.Value, out: []u8) ToolResult {
     if (!bridge.isDebugging())
         return errResult(out, "Error: No active debug session.");
 
-    const path = main.getCurrentDebuggeePath();
+    var path_buf: [main.DEBUGGEE_PATH_SIZE]u8 = undefined;
+    const path = main.copyCurrentDebuggeePath(&path_buf);
     if (path.len == 0)
         return errResult(out, "Error: Current debuggee path is unknown.");
 

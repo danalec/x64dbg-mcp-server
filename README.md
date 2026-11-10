@@ -35,7 +35,7 @@ Built with [Zig](https://ziglang.org/) — zero dependencies, single-binary outp
 
 ## Features
 
-- **84 MCP Tools:** Full debugger control — disassembly, stepping, breakpoints, memory allocation, registers, modules, threads, call stack, pattern scanning, string extraction, xrefs, symbols, bookmarks, PE analysis, OEP detection, module dumping, PEB/SEH inspection, tracing, and more.
+- **80 MCP Tools:** Full debugger control — disassembly, stepping, breakpoints, memory allocation, registers, modules, threads, call stack, pattern scanning, string extraction, xrefs, symbols, bookmarks, PE analysis, OEP detection, module dumping, PEB/SEH inspection, tracing, and more.
 - **22 Event Callbacks:** Full debugger event coverage — init, stop, breakpoint, exception, step, attach/detach, DLL load/unload, threads, and more.
 - **Zero Dependencies:** Pure native plugin, no runtime or framework needed.
 - **x32 and x64:** Single codebase, builds both architectures from one command.
@@ -54,8 +54,13 @@ Download the latest release or build from source:
 2. Launch x64dbg
 
 The MCP server starts automatically. Default ports:
-- **x64:** `0.0.0.0:9094`
-- **x32:** `0.0.0.0:9095`
+- **x64:** `127.0.0.1:9094`
+- **x32:** `127.0.0.1:9095`
+
+Loopback is the default on purpose: the server controls a debugger and writes
+memory. To listen on another interface, set the bind address to `0.0.0.0` in the
+config dialog — and understand that the bearer token is then the only thing
+standing between the network and the debugger.
 
 
 ## Usage
@@ -223,7 +228,9 @@ Changes take effect immediately — the server auto-restarts on save. Config is 
 
 ## Building
 
-Requires [Zig 0.16-dev](https://ziglang.org/download/) or later. Builds on Windows, WSL, Linux, or macOS.
+Requires [Zig 0.14.0](https://ziglang.org/download/) or later (the version in
+`build.zig.zon`; the CI builds with 0.14.0). Builds on Windows, WSL, Linux, or
+macOS.
 
 ```console
 zig build -Doptimize=ReleaseSafe --prefix dist

@@ -7,15 +7,28 @@ const std = @import("std");
 pub const JsonWriter = struct {
     buf: []u8,
     pos: usize = 0,
+    /// Set when a write did not fit. A silent truncation produces malformed JSON,
+    /// and a client cannot tell a truncated answer from a complete one, so the
+    /// writer records it and the caller refuses to send the frame.
+    overflowed: bool = false,
 
     pub fn init(buf: []u8) JsonWriter {
         return .{ .buf = buf, .pos = 0 };
     }
 
     pub fn raw(self: *JsonWriter, s: []const u8) void {
-        if (self.pos + s.len > self.buf.len) return;
+        if (self.pos + s.len > self.buf.len) {
+            self.overflowed = true;
+            return;
+        }
         @memcpy(self.buf[self.pos..][0..s.len], s);
         self.pos += s.len;
+    }
+
+    /// True when everything written fitted the buffer. A caller that ignores this
+    /// can send a truncated — that is, invalid — JSON frame.
+    pub fn ok(self: *const JsonWriter) bool {
+        return !self.overflowed;
     }
 
     pub fn beginObject(self: *JsonWriter) void {
@@ -349,4 +362,16 @@ test "getAddrField returns null when the buffer is too small" {
     defer parsed.deinit();
     var buf: [4]u8 = undefined;
     try std.testing.expect(getAddrField(parsed.value, "address", &buf) == null);
+}
+
+test "JsonWriter reports an overflow instead of truncating silently" {
+    var buf: [8]u8 = undefined;
+    var w = JsonWriter.init(&buf);
+    w.raw("12345678"); // exactly fits
+    try std.testing.expect(w.ok());
+    try std.testing.expectEqual(@as(usize, 8), w.pos);
+
+    w.raw("x"); // does not fit: nothing is written, and the writer says so
+    try std.testing.expect(!w.ok());
+    try std.testing.expectEqual(@as(usize, 8), w.pos);
 }
