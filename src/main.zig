@@ -5,10 +5,16 @@ const bridge = @import("core/bridge.zig");
 const mcp = @import("core/mcp_server.zig");
 const config = @import("core/config.zig");
 const icons = @import("resources/icons.zig");
+const sync = @import("core/sync.zig");
 const tools_mod = @import("mcp/tools.zig");
 
 const PLUGIN_NAME = "x64dbg-MCP Server";
 const PLUGIN_VERSION = 1;
+
+// x64dbg's command namespace is flat and global, so the commands of
+// this plugin carry the plugin name as their namespace.
+const COMMAND_START: [*:0]const u8 = "mcpserver.start\x00";
+const COMMAND_STOP: [*:0]const u8 = "mcpserver.stop\x00";
 
 var plugin_handle: c_int = 0;
 var main_menu: c_int = 0;
@@ -18,25 +24,31 @@ const MENU_TOGGLE: c_int = 1;
 const MENU_CONFIG: c_int = 2;
 const MENU_ABOUT: c_int = 3;
 
-// ── Concurrency ────────────────────────────────────────────────────
-// The debug callbacks run on x64dbg's threads; the HTTP server answers on a thread
-// per connection. The event ring and the debuggee path are touched from both, so
-// their accessors take this lock. Nothing holds it across I/O.
-var state_lock = std.Thread.Mutex{};
-
 // ── Event log ring buffer ──────────────────────────────────────────
+//
+// The ring buffer is written from x64dbg's debugger callbacks and read
+// from the HTTP worker threads, so every access goes through the lock.
 const EVENT_LOG_SIZE = 64;
 const EVENT_MSG_SIZE = 192;
 
 var event_log: [EVENT_LOG_SIZE][EVENT_MSG_SIZE]u8 = undefined;
-var event_log_lens: [EVENT_LOG_SIZE]usize = [_]usize{0} ** EVENT_LOG_SIZE;
+var event_log_lens: [EVENT_LOG_SIZE]usize = @splat(0);
 var event_log_head: usize = 0;
 var event_log_count: usize = 0;
+var event_log_lock: sync.Mutex = .{};
+
+/// The longest message the ring holds, for the caller's buffer.
+pub const MAX_EVENT = EVENT_MSG_SIZE;
+
+pub fn initLocks() void {
+    event_log_lock.init();
+    debuggee_path_lock.init();
+}
 
 pub fn pushEvent(msg: []const u8) void {
-    state_lock.lock();
-    defer state_lock.unlock();
     const len = @min(msg.len, EVENT_MSG_SIZE);
+    event_log_lock.lock();
+    defer event_log_lock.unlock();
     @memcpy(event_log[event_log_head][0..len], msg[0..len]);
     event_log_lens[event_log_head] = len;
     event_log_head = (event_log_head + 1) % EVENT_LOG_SIZE;
@@ -44,33 +56,28 @@ pub fn pushEvent(msg: []const u8) void {
 }
 
 pub fn getEventCount() usize {
-    state_lock.lock();
-    defer state_lock.unlock();
+    event_log_lock.lock();
+    defer event_log_lock.unlock();
     return event_log_count;
 }
 
-/// Copy event `index` into `out` and return the copied slice.
-///
-/// A slice into the ring must not escape the lock: between the unlock and the
-/// caller's read, a callback can wrap the buffer and overwrite it. Copying under
-/// the lock is the only shape that is safe for a reader on another thread.
-pub fn copyEvent(index: usize, out: []u8) []const u8 {
-    state_lock.lock();
-    defer state_lock.unlock();
-    if (index >= event_log_count) return out[0..0];
+/// Copy the event at `index` into `dst` and return the event's full
+/// length.  The copy happens under the lock so the caller never reads a
+/// slot the debugger callback thread is already overwriting.
+pub fn copyEvent(index: usize, dst: []u8) usize {
+    event_log_lock.lock();
+    defer event_log_lock.unlock();
+    if (index >= event_log_count) return 0;
     const start = if (event_log_count < EVENT_LOG_SIZE) 0 else event_log_head;
     const i = (start + index) % EVENT_LOG_SIZE;
-    const len = @min(event_log_lens[i], out.len);
-    @memcpy(out[0..len], event_log[i][0..len]);
-    return out[0..len];
+    const n = @min(event_log_lens[i], dst.len);
+    @memcpy(dst[0..n], event_log[i][0..n]);
+    return event_log_lens[i];
 }
 
-/// The longest message the ring holds, for the caller's buffer.
-pub const MAX_EVENT = EVENT_MSG_SIZE;
-
 pub fn clearEvents() void {
-    state_lock.lock();
-    defer state_lock.unlock();
+    event_log_lock.lock();
+    defer event_log_lock.unlock();
     event_log_count = 0;
     event_log_head = 0;
 }
@@ -83,23 +90,26 @@ pub fn clearEvents() void {
 pub const DEBUGGEE_PATH_SIZE = 1024;
 var current_debuggee_path: [DEBUGGEE_PATH_SIZE]u8 = undefined;
 var current_debuggee_path_len: usize = 0;
+var debuggee_path_lock: sync.Mutex = .{};
 
 pub fn setCurrentDebuggeePath(path: []const u8) void {
-    state_lock.lock();
-    defer state_lock.unlock();
     const len = @min(path.len, DEBUGGEE_PATH_SIZE - 1);
+    debuggee_path_lock.lock();
+    defer debuggee_path_lock.unlock();
     @memcpy(current_debuggee_path[0..len], path[0..len]);
     current_debuggee_path[len] = 0;
     current_debuggee_path_len = len;
 }
 
-/// Copy the debuggee path into `out` and return the copied slice (see copyEvent).
-pub fn copyCurrentDebuggeePath(out: []u8) []const u8 {
-    state_lock.lock();
-    defer state_lock.unlock();
-    const len = @min(current_debuggee_path_len, out.len);
-    @memcpy(out[0..len], current_debuggee_path[0..len]);
-    return out[0..len];
+/// Copy the current debuggee path into `dst` and return its length.  The
+/// copy happens under the lock: the path is written by the debugger
+/// callback thread and read by an HTTP worker thread.
+pub fn copyCurrentDebuggeePath(dst: []u8) usize {
+    debuggee_path_lock.lock();
+    defer debuggee_path_lock.unlock();
+    const n = @min(current_debuggee_path_len, dst.len);
+    @memcpy(dst[0..n], current_debuggee_path[0..n]);
+    return n;
 }
 
 const HWND = ?*anyopaque;
@@ -109,6 +119,11 @@ extern "user32" fn MessageBoxA(hWnd: HWND, lpText: [*:0]const u8, lpCaption: [*:
 
 export fn pluginit(initStruct: *bridge.PLUG_INITSTRUCT) callconv(.c) c_int {
     bridge.init() catch return 0;
+
+    // The debugger callbacks and the HTTP worker threads share state, so
+    // the locks protecting it have to be ready before either side runs.
+    initLocks();
+    mcp.initLocks();
 
     initStruct.sdkVersion = bridge.PLUG_SDKVERSION;
     initStruct.pluginVersion = PLUGIN_VERSION;
@@ -122,12 +137,23 @@ export fn pluginit(initStruct: *bridge.PLUG_INITSTRUCT) callconv(.c) c_int {
     plugin_handle = initStruct.pluginHandle;
     bridge.logPuts("[x64dbg-MCP Server] Plugin initialized.\x00");
 
-    _ = bridge._plugin_registercommand(plugin_handle, "StartMCPServer\x00", cmdStartServer, 0);
-    bridge.logPuts("[x64dbg-MCP Server] Command \"StartMCPServer\" registered!\x00");
-    _ = bridge._plugin_registercommand(plugin_handle, "StopMCPServer\x00", cmdStopServer, 0);
-    bridge.logPuts("[x64dbg-MCP Server] Command \"StopMCPServer\" registered!\x00");
+    // x64dbg has one flat command namespace: a command name that
+    // another plugin already registered cannot be registered twice, and
+    // the registration fails silently.  The commands are therefore
+    // namespaced with the plugin name.
+    registerCommand(COMMAND_START, cmdStartServer);
+    registerCommand(COMMAND_STOP, cmdStopServer);
 
     return 1;
+}
+
+/// Register a command and report whether it actually was registered.
+fn registerCommand(name: [*:0]const u8, cb: bridge.CBPLUGINCOMMAND) void {
+    const ok = bridge._plugin_registercommand(plugin_handle, name, cb, 0) != 0;
+    const text = if (ok) "registered!" else "could not be registered, the name is already taken!";
+    var buf: [192]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "[x64dbg-MCP Server] Command \"{s}\" {s}\x00", .{ std.mem.span(name), text }) catch return;
+    bridge.logPuts(@ptrCast(msg.ptr));
 }
 
 export fn plugsetup(setupStruct: *bridge.PLUG_SETUPSTRUCT) callconv(.c) void {
@@ -199,8 +225,8 @@ export fn plugsetup(setupStruct: *bridge.PLUG_SETUPSTRUCT) callconv(.c) void {
 
 export fn plugstop() callconv(.c) c_int {
     mcp.stop();
-    _ = bridge._plugin_unregistercommand(plugin_handle, "StartMCPServer\x00");
-    _ = bridge._plugin_unregistercommand(plugin_handle, "StopMCPServer\x00");
+    _ = bridge._plugin_unregistercommand(plugin_handle, COMMAND_START);
+    _ = bridge._plugin_unregistercommand(plugin_handle, COMMAND_STOP);
     bridge.logPuts("[x64dbg-MCP Server] Plugin stopped.\x00");
     return 1;
 }
@@ -215,6 +241,8 @@ export fn CBMENUENTRY(_: bridge.CBTYPE, info: *bridge.PLUG_CB_MENUENTRY) callcon
 }
 
 fn toggleServer() void {
+    // The running flag is atomic: it is written by the server thread and
+    // read by the GUI thread and the debugger callbacks.
     if (mcp.server_running.load(.acquire)) {
         mcp.stop();
     } else {
